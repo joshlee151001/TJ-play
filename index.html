@@ -556,6 +556,10 @@ try {
     watch: (no, cb) => onValue(ref(db, `tjmart/kiosks/k${no}`), (s) => cb(s.val()), () => cb(null)),
     watchAll: (cb) => onValue(ref(db, "tjmart/kiosks"), (s) => cb(s.val() || {}), () => cb({})),
     connected: (cb) => onValue(ref(db, ".info/connected"), (s) => cb(s.val() === true)),
+    // 가게 데이터 (상품 · 회원 · 매출 · 설정) — 모든 키오스크가 같이 씀
+    put: (path, v) => set(ref(db, "tjmart/store/" + path), v),
+    listen: (path, cb) => onValue(ref(db, path ? "tjmart/store/" + path : "tjmart/store"), (s) => cb(s.val())),
+    once: (path, cb) => onValue(ref(db, path ? "tjmart/store/" + path : "tjmart/store"), (s) => cb(s.val()), { onlyOnce: true }),
   };
   window.dispatchEvent(new Event("tjremote-ready"));
 } catch (e) {
@@ -661,6 +665,92 @@ if (!products) {
   save(KEY.products, products);
 }
 const productByCode = (code) => products.find((p) => p.barcode === code);
+
+/* ---------------- 모든 키오스크가 같이 쓰는 저장 (온챗 Firebase) ----------------
+   이 기기에도 저장해 두니까 인터넷이 끊겨도 계속 쓸 수 있고, 다시 연결되면 맞춰짐 */
+const plain = (v) => JSON.parse(JSON.stringify(v));
+function remotePut(path, value) {
+  if (STAFF_SCREEN || !window.tjRemote) return;
+  window.tjRemote.put(path, value == null ? null : plain(value)).catch((e) => console.warn("공유 저장 실패", path, e));
+}
+function sharedConfig() {
+  return { pin: settings.pin, staffCode: settings.staffCode, pinChanged: !!settings.pinChanged, seq: load(KEY.seq, 0) };
+}
+function persistConfig() {
+  save(KEY.settings, settings);
+  remotePut("config", sharedConfig());
+}
+function persistProduct(p) {
+  save(KEY.products, products);
+  remotePut(`products/${p.id}`, p);
+  remotePut("config", sharedConfig()); // 바코드 번호 순서도 같이
+}
+function persistProductDelete(id) {
+  save(KEY.products, products);
+  remotePut(`products/${id}`, null);
+}
+function persistMember(phone) {
+  save(KEY.members, members);
+  remotePut(`members/${phone}`, members[phone] || null);
+}
+function persistSale(sale) {
+  save(KEY.sales, sales);
+  remotePut(`sales/${sale.id}`, sale);
+}
+function clearShared(kind) {
+  if (kind === "sales") { sales = []; save(KEY.sales, sales); }
+  if (kind === "members") { members = {}; save(KEY.members, members); }
+  remotePut(kind, null);
+}
+
+let syncing = false;
+function startSync() {
+  if (syncing || STAFF_SCREEN || !window.tjRemote) return;
+  syncing = true;
+  window.tjRemote.once("", (store) => {
+    // 처음 연결된 기기면 이 기기 데이터를 가게 데이터로 올림
+    if (!store || !store.config) {
+      remotePut("config", sharedConfig());
+      for (const p of products) remotePut(`products/${p.id}`, p);
+      for (const [ph, m] of Object.entries(members)) remotePut(`members/${ph}`, m);
+      for (const sl of sales) remotePut(`sales/${sl.id}`, sl);
+    }
+    window.tjRemote.listen("config", (c) => {
+      if (!c) return;
+      settings.pin = c.pin || settings.pin;
+      settings.staffCode = c.staffCode || settings.staffCode;
+      settings.pinChanged = !!c.pinChanged;
+      save(KEY.settings, settings);
+      if ((c.seq || 0) > load(KEY.seq, 0)) save(KEY.seq, c.seq);
+      refreshAfterSync("settings");
+    });
+    window.tjRemote.listen("products", (map) => {
+      products = Object.values(map || {}).filter((p) => p && p.barcode);
+      save(KEY.products, products);
+      refreshAfterSync("products");
+    });
+    window.tjRemote.listen("members", (map) => {
+      members = {};
+      for (const [ph, m] of Object.entries(map || {})) if (m) members[ph] = m;
+      save(KEY.members, members);
+      refreshAfterSync("members");
+    });
+    window.tjRemote.listen("sales", (map) => {
+      sales = Object.values(map || {}).filter(Boolean).sort((a, b) => a.at - b.at);
+      save(KEY.sales, sales);
+      refreshAfterSync("sales");
+    });
+  });
+}
+// 다른 키오스크에서 바뀌면 화면 다시 그리기 (입력 중인 창이 열려 있으면 그건 그대로)
+function refreshAfterSync(kind) {
+  if (typeof renderCart === "function") renderCart();
+  const adminOpen = !$("admin").classList.contains("hidden");
+  const modalOpen = !$("overlay").classList.contains("hidden");
+  if (!adminOpen || modalOpen) return;
+  const map = { products: ["products", "print"], members: ["members"], sales: ["sales"], settings: ["settings", "print"] };
+  if ((map[kind] || []).includes(adminTab)) renderAdmin();
+}
 
 /* ---------------- 소리 ---------------- */
 let audioCtx = null;
@@ -1028,6 +1118,7 @@ function startRemote() {
   remoteReady = true;
   remoteSet(calling ? "calling" : "idle");
   watchMyKiosk();
+  startSync();
 }
 function watchMyKiosk() {
   if (unwatchKiosk) unwatchKiosk();
@@ -1387,7 +1478,7 @@ function finishOrder() {
     m.spent = (m.spent || 0) + o.due;
     m.last = Date.now();
     members[o.phone] = m;
-    save(KEY.members, members);
+    persistMember(o.phone);
     balance = m.points;
   }
   const sale = {
@@ -1402,7 +1493,7 @@ function finishOrder() {
     phone: o.phone, earned,
   };
   sales.push(sale);
-  save(KEY.sales, sales);
+  persistSale(sale);
 
   sound.success();
   const lines = $("done-lines");
@@ -1504,7 +1595,7 @@ function adminProducts(body) {
       act.append(mini("수정", "", () => editProduct(pr)), document.createTextNode(" "), mini("삭제", "red", () =>
         confirmBox(`'${pr.name}'을(를) 삭제할까요?`, () => {
           products = products.filter((x) => x !== pr);
-          save(KEY.products, products);
+          persistProductDelete(pr.id);
           renderAdmin();
         })
       ));
@@ -1597,7 +1688,7 @@ function editProduct(pr) {
       const n = Number(code.slice(3, 12));
       if (n > load(KEY.seq, 0)) save(KEY.seq, n);
     }
-    save(KEY.products, products);
+    persistProduct(item);
     stopAdminScan();
     closeModal();
     toast(isNew ? "상품을 추가했어요" : "상품을 고쳤어요", "ok");
@@ -1814,7 +1905,7 @@ function adminSales(body) {
   body.append(bp);
 
   const lp = panel(`판매 기록 (${sales.length}건)`, sales.length ? mini("기록 지우기", "red", () =>
-    confirmBox("판매 기록을 모두 지울까요?", () => { sales = []; save(KEY.sales, sales); renderAdmin(); })
+    confirmBox("판매 기록을 모두 지울까요?", () => { clearShared("sales"); renderAdmin(); })
   ) : null);
   if (!sales.length) lp.append(el("div", "empty-note", "아직 판매 기록이 없어요."));
   else {
@@ -1851,7 +1942,7 @@ function adminMembers(body) {
       act.append(
         mini("포인트 수정", "", () => editPoints(phone)),
         document.createTextNode(" "),
-        mini("삭제", "red", () => confirmBox(`${fmtPhone(phone)} 회원을 삭제할까요?`, () => { delete members[phone]; save(KEY.members, members); renderAdmin(); }))
+        mini("삭제", "red", () => confirmBox(`${fmtPhone(phone)} 회원을 삭제할까요?`, () => { delete members[phone]; persistMember(phone); renderAdmin(); }))
       );
       tr.append(el("td", "num", fmtPhone(phone)), el("td", "r num", tj(m.points)), el("td", "r num", `${m.visits || 0}번`), el("td", "r num", won(m.spent || 0)), act);
       tb.append(tr);
@@ -1872,7 +1963,7 @@ function editPoints(phone) {
   $("ep-c").onclick = closeModal;
   $("ep-s").onclick = () => {
     members[phone].points = Math.max(0, Number($("ep-v").value.replace(/\D/g, "")) || 0);
-    save(KEY.members, members);
+    persistMember(phone);
     closeModal();
     renderAdmin();
   };
@@ -1888,7 +1979,7 @@ function adminSettings(body) {
     if (!/^\d{4}$/.test(v)) return toast("숫자 4자리로 해 주세요", "err");
     settings.pin = v;
     settings.pinChanged = true;
-    save(KEY.settings, settings);
+    persistConfig();
     $("s-pin").value = "";
     toast("비밀번호를 바꿨어요", "ok");
   }));
@@ -1901,7 +1992,7 @@ function adminSettings(body) {
   row.append(svg, mini("새 카드 번호 만들기", "red", () =>
     confirmBox("새 번호를 만들면 예전 직원 카드는 못 써요. 만들까요?", () => {
       settings.staffCode = "TJ-STAFF-" + String(Math.floor(1000 + Math.random() * 9000));
-      save(KEY.settings, settings);
+      persistConfig();
       renderAdmin();
       toast("새 직원 카드 번호를 만들었어요. '바코드 인쇄'에서 다시 뽑아 주세요", "ok");
     })
@@ -1947,12 +2038,23 @@ function adminSettings(body) {
   $("s-sound").checked = settings.sound;
   $("s-sound").onchange = () => { settings.sound = $("s-sound").checked; save(KEY.settings, settings); };
 
-  const dp = panel("🗑️ 데이터");
+  const syncP = panel("🔗 모든 키오스크가 같이 써요");
+  const syncD = el("div", null, "상품 · 직원 카드 · 비밀번호 · 회원 포인트 · 매출은 모든 키오스크가 같이 써요. 한 곳에서 바꾸면 다른 키오스크에도 바로 바뀌어요. (키오스크 번호 · 카메라 · 소리는 기기마다 따로)");
+  syncD.style.cssText = "color:var(--sub);font-size:14px;line-height:1.6";
+  syncP.append(syncD);
+  body.append(syncP);
+
+  const dp = panel("🗑️ 데이터 (모든 키오스크에서 지워져요)");
   const btns = el("div", "step-btns");
   btns.append(
-    mini("판매 기록 지우기", "red", () => confirmBox("판매 기록을 모두 지울까요?", () => { sales = []; save(KEY.sales, sales); toast("지웠어요"); })),
-    mini("회원 지우기", "red", () => confirmBox("회원과 포인트를 모두 지울까요?", () => { members = {}; save(KEY.members, members); toast("지웠어요"); })),
-    mini("예시 상품 지우기", "red", () => confirmBox("예시 상품 5개를 지울까요?", () => { products = products.filter((p) => !p.sample); save(KEY.products, products); toast("지웠어요"); }))
+    mini("판매 기록 지우기", "red", () => confirmBox("판매 기록을 모두 지울까요?", () => { clearShared("sales"); toast("지웠어요"); })),
+    mini("회원 지우기", "red", () => confirmBox("회원과 포인트를 모두 지울까요?", () => { clearShared("members"); toast("지웠어요"); })),
+    mini("예시 상품 지우기", "red", () => confirmBox("예시 상품을 지울까요?", () => {
+      const gone = products.filter((p) => p.sample);
+      products = products.filter((p) => !p.sample);
+      gone.forEach((p) => persistProductDelete(p.id));
+      toast("지웠어요");
+    }))
   );
   dp.append(btns);
   body.append(dp);
